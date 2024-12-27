@@ -1,0 +1,105 @@
+pipeline {
+    agent {
+        node {
+            label 'node1'
+        }
+    }
+    options {
+        buildDiscarder logRotator( 
+            daysToKeepStr: '30', 
+            numToKeepStr: '30'
+        )
+    }
+    stages {
+        stage('Git Checkout') {
+            steps {
+                script{
+                    gitCheckout(
+                        branch: "release",
+                        credentialsID: "github_cicd_user",
+                        url: "https://myuser@github.com/myrepo.git"
+                    )
+                }
+            }
+        } 
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def BUILD_IMAGE_NAME = "111111111111.dkr.ecr.ap-south-1.amazonaws.com/ecr_repo:latest"
+                    
+                    sh "docker image prune -f"
+                    
+                    dir('mydir'){
+                    sh """
+                    aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 111111111111.dkr.ecr.ap-south-1.amazonaws.com
+
+                    # Build the Docker image once
+                    docker build -t ${BUILD_IMAGE_NAME} .
+
+                    # Push both tags
+                    docker push ${BUILD_IMAGE_NAME}
+                    docker rmi -f ${BUILD_IMAGE_NAME} """
+                    }
+                } 
+            }                
+        }
+        stage('Fetching ECR Image Scan Report') {
+            steps {
+                script {
+                    def totalCritical = 0
+                    def totalHigh = 0
+                    def REPO_NAME = 'ecr_repo'
+                    def IMAGE_TAG = 'latest'
+                    def REGION = 'ap-south-1'
+
+                    // Run AWS CLI command and save output to file
+                    sh "aws ecr describe-image-scan-findings --repository-name ${REPO_NAME} --image-id imageTag=${IMAGE_TAG} --region ${REGION} --max-results 100 > output.json"
+
+                    // Read and process output file
+                    def output = readFile("output.json").trim()
+
+                    // Write JSON content to temporary files for jq processing
+                    writeFile file: "critical.txt", text: sh(script: "jq '.imageScanFindings.findingSeverityCounts.CRITICAL // 0' output.json", returnStdout: true).trim()
+                    writeFile file: "high.txt", text: sh(script: "jq '.imageScanFindings.findingSeverityCounts.HIGH // 0' output.json", returnStdout: true).trim()
+
+                    // Read counts from the temporary files
+                    def critical = readFile("critical.txt").trim().toInteger()
+                    def high = readFile("high.txt").trim().toInteger()
+
+                    totalCritical += critical
+                    totalHigh += high
+
+                    // Check for next token
+                    def nextToken = sh(script: "jq -r '.nextToken' output.json", returnStdout: true).trim()
+
+                    while (nextToken != 'null' && nextToken != '') {
+                        // Run AWS CLI command with next token and save output to file
+                        sh "aws ecr describe-image-scan-findings --repository-name ${REPO_NAME} --image-id imageTag=${IMAGE_TAG} --region ${REGION} --max-results 100 --next-token ${nextToken} > output.json"
+                        output = readFile('output.json').trim()
+
+                        // Write JSON content to temporary files for jq processing
+                        writeFile file: "critical.txt", text: sh(script: "jq '.imageScanFindings.findingSeverityCounts.CRITICAL // 0' output.json", returnStdout: true).trim()
+                        writeFile file: "high.txt", text: sh(script: "jq '.imageScanFindings.findingSeverityCounts.HIGH // 0' output.json", returnStdout: true).trim()
+
+                        // Read counts from the temporary files
+                        critical = readFile('critical.txt').trim().toInteger()
+                        high = readFile('high.txt').trim().toInteger()
+
+                        totalCritical += critical
+                        totalHigh += high
+
+                        // Check for next token
+                        nextToken = sh(script: "jq -r '.nextToken' output.json", returnStdout: true).trim()
+                    }
+
+                    echo "Total Critical Vulnerabilities: ${totalCritical}"
+                    echo "Total High Vulnerabilities: ${totalHigh}"
+
+                    if (totalCritical > 10) {
+                        error "Build failed due to critical vulnerabilities exceeding threshold: ${totalCritical} critical vulnerabilities found."
+                    }
+                }
+            }
+        }
+    }
+}
